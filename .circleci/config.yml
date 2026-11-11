@@ -102,16 +102,20 @@ commands:
           name: Trust the EC2 host key (pas de StrictHostKeyChecking=no)
           command: |
             mkdir -p ~/.ssh
-            echo "${<< parameters.known_hosts_var >>}" >> ~/.ssh/known_hosts
+            # Clés PUBLIQUES du serveur, versionnées dans le dépôt (+ variable optionnelle)
+            cat .circleci/known_hosts >> ~/.ssh/known_hosts
+            if [ -n "${<< parameters.known_hosts_var >>:-}" ]; then echo "${<< parameters.known_hosts_var >>}" >> ~/.ssh/known_hosts; fi
             chmod 600 ~/.ssh/known_hosts
       - run:
           name: Deploy << parameters.app_env >> to AWS EC2
           command: |
             TARGET="${<< parameters.ssh_user_var >>}@${<< parameters.ssh_host_var >>}"
+            # Echec immédiat si l'hôte est inconnu (pas de prompt interactif), timeout court
+            SSH_OPTS="-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
             # Login GHCR côté EC2 avec un token en lecture seule, passé par stdin (jamais en argument)
-            echo "$GHCR_READ_PAT" | ssh "$TARGET" "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
+            echo "$GHCR_READ_PAT" | ssh $SSH_OPTS "$TARGET" "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
             # Le script est exécuté à distance ; les variables sont passées en arguments explicites
-            ssh "$TARGET" "bash -s -- '<< parameters.app_env >>' '$IMAGE' '<< parameters.port >>'" < scripts/deploy.sh
+            ssh $SSH_OPTS "$TARGET" "bash -s -- '<< parameters.app_env >>' '$IMAGE' '<< parameters.port >>'" < scripts/deploy.sh
 
 # ---------------------------------------------------------------------------
 # Jobs
