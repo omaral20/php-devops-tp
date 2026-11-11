@@ -92,11 +92,21 @@ commands:
         type: env_var_name
       port:
         type: string
+      ssh_key_var:
+        type: env_var_name
+        description: "Variable contenant la clé privée de déploiement encodée en base64"
     steps:
       - checkout
-      # Sans "fingerprints", CircleCI ajoute toutes les clés SSH déclarées dans le projet.
-      # Pour restreindre : fingerprints: ["SHA256:xxxx"] (valeur en dur, pas de variable).
-      - add_ssh_keys
+      # Clé privée de déploiement stockée dans une variable CircleCI masquée (base64),
+      # écrite dans un fichier 600 le temps du job uniquement.
+      - run:
+          name: Load deploy SSH key
+          command: |
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            if [ -z "${<< parameters.ssh_key_var >>:-}" ]; then echo "Variable << parameters.ssh_key_var >> absente"; exit 1; fi
+            echo "${<< parameters.ssh_key_var >>}" | base64 -d | tr -d '\r' > ~/.ssh/id_deploy
+            chmod 600 ~/.ssh/id_deploy
+            ssh-keygen -lf ~/.ssh/id_deploy   # affiche seulement l'empreinte
       - compute-image-name
       - run:
           name: Trust the EC2 host key (pas de StrictHostKeyChecking=no)
@@ -111,7 +121,7 @@ commands:
           command: |
             TARGET="${<< parameters.ssh_user_var >>}@${<< parameters.ssh_host_var >>}"
             # Echec immédiat si l'hôte est inconnu (pas de prompt interactif), timeout court
-            SSH_OPTS="-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
+            SSH_OPTS="-i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
             # Login GHCR côté EC2 avec un token en lecture seule, passé par stdin (jamais en argument)
             echo "$GHCR_READ_PAT" | ssh $SSH_OPTS "$TARGET" "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
             # Le script est exécuté à distance ; les variables sont passées en arguments explicites
@@ -327,6 +337,7 @@ jobs:
           ssh_host_var: STAGING_SSH_HOST
           known_hosts_var: STAGING_KNOWN_HOSTS
           port: "8080"
+          ssh_key_var: STAGING_SSH_KEY_B64
 
   deploy-ssh-production:
     executor: simple-executor
@@ -337,6 +348,7 @@ jobs:
           ssh_host_var: PRODUCTION_SSH_HOST
           known_hosts_var: PRODUCTION_KNOWN_HOSTS
           port: "80"
+          ssh_key_var: PRODUCTION_SSH_KEY_B64
 
 # ---------------------------------------------------------------------------
 # Workflow : qualité -> image -> scan -> validation manuelle -> déploiement
