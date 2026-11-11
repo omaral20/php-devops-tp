@@ -57,7 +57,9 @@ commands:
       - run:
           name: Compute image name
           command: |
-            REPOSITORY=$(echo "ghcr.io/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" | tr '[:upper:]' '[:lower:]' | tr -d '_')
+            # GHCR_USERNAME (et non CIRCLE_PROJECT_USERNAME) : avec la GitHub App, ce dernier peut valoir le nom de l'org CircleCI
+            REPO_NAME=$(basename -s .git "${CIRCLE_REPOSITORY_URL:-php-devops-tp}")
+            REPOSITORY=$(echo "ghcr.io/$GHCR_USERNAME/$REPO_NAME" | tr '[:upper:]' '[:lower:]' | tr -d '_')
             BRANCH_TAG=$(echo "$CIRCLE_BRANCH" | tr '[:upper:]' '[:lower:]' | tr '/' '-' | tr -cd '[:alnum:]._-' | cut -c 1-100)
             TAG="${BRANCH_TAG}-${CIRCLE_SHA1:0:7}"
             echo "export REPOSITORY=$REPOSITORY" >> "$BASH_ENV"
@@ -284,7 +286,7 @@ jobs:
               --build-arg GIT_URL=$(echo ${CIRCLE_REPOSITORY_URL} | sed -e 's/^git@/https:\/\//g' -e 's/\.git$//g' -e 's/:/\//g') \
               --build-arg SQLITE_VERSION=3430200 \
               --build-arg SQLITE_YEAR=2023 \
-              --build-arg PROJECT_USERNAME=$CIRCLE_PROJECT_USERNAME \
+              --build-arg PROJECT_USERNAME=$GHCR_USERNAME \
               .
 
             docker push "$IMAGE"
