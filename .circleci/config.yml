@@ -179,8 +179,12 @@ jobs:
           name: Run PHP Mess Detector
           command: |
             mkdir -p reports
-            phpmd src text cleancode,codesize,controversial,design,naming,unusedcode --ignore-violations-on-exit || true
-            phpmd src html cleancode,codesize,controversial,design,naming,unusedcode --reportfile reports/phpmd.html --ignore-violations-on-exit
+            RULES=cleancode,codesize,controversial,design,naming,unusedcode
+            phpmd --version
+            # Non bloquant : le job produit un rapport ; code 2 = violations, 3 = erreurs de traitement
+            phpmd src text "$RULES" || echo "phpmd exit code: $?"
+            phpmd src html "$RULES" --reportfile reports/phpmd.html || true
+            ls -l reports/
       - store_artifacts:
           path: reports/phpmd.html
           destination: phpmd-report
