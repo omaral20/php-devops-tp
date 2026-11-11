@@ -1,0 +1,394 @@
+version: 2.1
+
+# Convention de nommage : préfixe = nature du job (build-, lint-, test-, security-,
+# metrics-, deploy-, debug-), suffixe = outil utilisé (phpcs, phpmd, phploc...).
+#
+# Variables à définir dans CircleCI (Project Settings > Environment Variables) :
+#   GHCR_USERNAME              compte GitHub (minuscules)
+#   GHCR_PAT                   PAT GitHub, scope write:packages (push depuis la CI)
+#   GHCR_READ_PAT              PAT GitHub, scope read:packages uniquement (pull sur l'EC2)
+#   STAGING_SSH_USER / STAGING_SSH_HOST / STAGING_KNOWN_HOSTS
+#   PRODUCTION_SSH_USER / PRODUCTION_SSH_HOST / PRODUCTION_KNOWN_HOSTS
+#   (*_KNOWN_HOSTS = sortie de "ssh-keyscan -t ed25519 <ip>" vérifiée à la main)
+
+# ---------------------------------------------------------------------------
+# Ancres réutilisables
+# ---------------------------------------------------------------------------
+persist_to_workspace: &persist_to_workspace
+  persist_to_workspace:
+    root: .
+    paths:
+      - .
+
+attach_workspace: &attach_workspace
+  attach_workspace:
+    at: ~/project
+
+# ---------------------------------------------------------------------------
+# Executors (PHP 8.2 : composer.json exige php >= 8.2)
+# ---------------------------------------------------------------------------
+executors:
+  php-executor:
+    resource_class: small
+    shell: /bin/bash
+    docker:
+      - name: localhost
+        image: cimg/php:8.2
+  builder-executor:
+    resource_class: small
+    shell: /bin/bash
+    docker:
+      - image: cimg/php:8.2-node
+        name: localhost
+  simple-executor:
+    resource_class: small
+    shell: /bin/bash
+    docker:
+      - image: cimg/base:stable
+        name: localhost
+
+# ---------------------------------------------------------------------------
+# Commandes réutilisables
+# ---------------------------------------------------------------------------
+commands:
+  compute-image-name:
+    description: "Calcule le nom complet de l'image (ghcr.io/owner/repo:branche-sha)"
+    steps:
+      - run:
+          name: Compute image name
+          command: |
+            REPOSITORY=$(echo "ghcr.io/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" | tr '[:upper:]' '[:lower:]' | tr -d '_')
+            BRANCH_TAG=$(echo "$CIRCLE_BRANCH" | tr '[:upper:]' '[:lower:]' | tr '/' '-' | tr -cd '[:alnum:]._-' | cut -c 1-100)
+            TAG="${BRANCH_TAG}-${CIRCLE_SHA1:0:7}"
+            echo "export REPOSITORY=$REPOSITORY" >> "$BASH_ENV"
+            echo "export TAG=$TAG" >> "$BASH_ENV"
+            echo "export IMAGE=$REPOSITORY:$TAG" >> "$BASH_ENV"
+            echo "Image : $REPOSITORY:$TAG"
+
+  install-global-tool:
+    description: "Installe un outil PHP via composer global (isolé des dépendances du projet)"
+    parameters:
+      package:
+        type: string
+    steps:
+      - run:
+          name: Install << parameters.package >>
+          command: |
+            composer global require --no-interaction --no-progress "<< parameters.package >>"
+            echo "export PATH=\"$(composer global config bin-dir --absolute 2>/dev/null):\$PATH\"" >> "$BASH_ENV"
+
+  deploy-over-ssh:
+    description: "Déploie l'image sur une instance EC2 via SSH"
+    parameters:
+      app_env:
+        type: string
+      ssh_user_var:
+        type: env_var_name
+      ssh_host_var:
+        type: env_var_name
+      known_hosts_var:
+        type: env_var_name
+      port:
+        type: string
+    steps:
+      - checkout
+      # Sans "fingerprints", CircleCI ajoute toutes les clés SSH déclarées dans le projet.
+      # Pour restreindre : fingerprints: ["SHA256:xxxx"] (valeur en dur, pas de variable).
+      - add_ssh_keys
+      - compute-image-name
+      - run:
+          name: Trust the EC2 host key (pas de StrictHostKeyChecking=no)
+          command: |
+            mkdir -p ~/.ssh
+            echo "${<< parameters.known_hosts_var >>}" >> ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+      - run:
+          name: Deploy << parameters.app_env >> to AWS EC2
+          command: |
+            TARGET="${<< parameters.ssh_user_var >>}@${<< parameters.ssh_host_var >>}"
+            # Login GHCR côté EC2 avec un token en lecture seule, passé par stdin (jamais en argument)
+            echo "$GHCR_READ_PAT" | ssh "$TARGET" "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
+            # Le script est exécuté à distance ; les variables sont passées en arguments explicites
+            ssh "$TARGET" "bash -s -- '<< parameters.app_env >>' '$IMAGE' '<< parameters.port >>'" < scripts/deploy.sh
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+jobs:
+  debug-info:
+    executor: php-executor
+    steps:
+      - run:
+          name: Debug
+          # "env" a été retiré : il affichait toutes les variables (dont les secrets) dans les logs
+          command: |
+            echo "Current user: $USER"
+            echo "Home directory: $HOME"
+            echo "Operating system: $(uname -a)"
+            echo "Current working directory: $(pwd)"
+            echo "Current date: $(date)"
+            php -v
+            composer --version
+
+  build-setup:
+    executor: php-executor
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v2-dependencies-{{ checksum "composer.lock" }}
+            - v2-dependencies-
+      - run:
+          name: Install dependencies
+          command: composer install --no-interaction --no-ansi --prefer-dist
+      - save_cache:
+          paths:
+            - ./vendor
+          key: v2-dependencies-{{ checksum "composer.lock" }}
+      - *persist_to_workspace
+
+  lint-phpcs:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - run:
+          name: Install PHP_CodeSniffer and PHPCompatibility
+          command: composer require --dev --no-interaction "squizlabs/php_codesniffer=*" "phpcompatibility/php-compatibility=*"
+      - run:
+          name: Run PHP_CodeSniffer (non bloquant)
+          command: |
+            set +e
+            ./vendor/bin/phpcs --standard=phpcs.xml --report-full --report-checkstyle=phpcs-report.xml --extensions=php --ignore=vendor/ src public tests
+            result=$?
+            set -e
+            # 0 = OK, 1 = violations, 2 = violations corrigeables : on n'échoue que sur une vraie erreur d'exécution
+            if [ $result -le 2 ]; then exit 0; else exit $result; fi
+      - store_artifacts:
+          path: phpcs-report.xml
+          destination: phpcs-report
+
+  lint-phpmd:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - install-global-tool:
+          package: phpmd/phpmd
+      - run:
+          name: Run PHP Mess Detector
+          command: |
+            mkdir -p reports
+            phpmd src text cleancode,codesize,controversial,design,naming,unusedcode --ignore-violations-on-exit || true
+            phpmd src html cleancode,codesize,controversial,design,naming,unusedcode --reportfile reports/phpmd.html --ignore-violations-on-exit
+      - store_artifacts:
+          path: reports/phpmd.html
+          destination: phpmd-report
+
+  lint-php-doc-check:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - install-global-tool:
+          package: niels-de-blaauw/php-doc-check
+      - run:
+          name: Run php-doc-check (fonctions complexes non documentées)
+          command: |
+            mkdir -p reports
+            set +e
+            php-doc-check src | tee reports/php-doc-check.txt
+            set -e
+            exit 0
+      - store_artifacts:
+          path: reports/php-doc-check.txt
+          destination: php-doc-check-report
+
+  metrics-phpmetrics:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - install-global-tool:
+          package: phpmetrics/phpmetrics
+      - run:
+          name: Run PhpMetrics
+          command: phpmetrics --report-html=reports/phpmetrics src
+      - store_artifacts:
+          path: reports/phpmetrics
+          destination: phpmetrics-report
+
+  metrics-phploc:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - install-global-tool:
+          package: phploc/phploc
+      - run:
+          name: Run phploc
+          command: |
+            mkdir -p reports
+            phploc src | tee reports/phploc.txt
+            phploc --log-json=reports/phploc.json src > /dev/null
+      - store_artifacts:
+          path: reports
+          destination: phploc-report
+
+  security-check-dependencies:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - run:
+          name: Composer audit (remplace local-php-security-checker, archivé)
+          command: |
+            composer audit --no-dev --format=json > security-report.json || AUDIT_FAILED=1
+            cat security-report.json
+            # Bloquant : une dépendance de prod vulnérable doit casser le pipeline
+            if [ -n "${AUDIT_FAILED:-}" ]; then echo "Vulnérabilités détectées"; exit 1; fi
+      - store_artifacts:
+          path: security-report.json
+          destination: security-report
+
+  test-phpunit:
+    executor: php-executor
+    steps:
+      - *attach_workspace
+      - run:
+          name: Check if PHPUnit config is present, otherwise skip the job
+          command: |
+            if [ ! -f "phpunit.xml" ]; then
+              echo "No PHPUnit tests found, skipping job."
+              circleci step halt
+            fi
+      - run:
+          name: Run PHPUnit (déjà dans require-dev, pas de composer require)
+          command: |
+            mkdir -p test-results/phpunit
+            ./vendor/bin/phpunit --testsuite=Unit --log-junit test-results/phpunit/junit.xml
+      - store_test_results:
+          path: test-results
+
+  build-docker-image:
+    executor: builder-executor
+    steps:
+      - checkout
+      - setup_remote_docker
+      - compute-image-name
+      - run:
+          name: Build and Push Docker Image to GHCR
+          command: |
+            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+
+            docker build \
+              -f Docker/Dockerfile \
+              -t "$IMAGE" \
+              --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+              --build-arg TAG="${TAG}" \
+              --build-arg GIT_COMMIT=$(git rev-parse -q --verify HEAD) \
+              --build-arg GIT_URL=$(echo ${CIRCLE_REPOSITORY_URL} | sed -e 's/^git@/https:\/\//g' -e 's/\.git$//g' -e 's/:/\//g') \
+              --build-arg SQLITE_VERSION=3430200 \
+              --build-arg SQLITE_YEAR=2023 \
+              --build-arg PROJECT_USERNAME=$CIRCLE_PROJECT_USERNAME \
+              .
+
+            docker push "$IMAGE"
+
+  security-trivy-image:
+    executor: simple-executor
+    steps:
+      - compute-image-name
+      - run:
+          name: Install Trivy
+          command: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ./bin
+      - run:
+          name: Scan the pushed image (directement depuis GHCR)
+          command: |
+            mkdir -p reports
+            export TRIVY_USERNAME="$GHCR_USERNAME" TRIVY_PASSWORD="$GHCR_PAT"
+            ./bin/trivy image --image-src remote --severity HIGH,CRITICAL --format table "$IMAGE" | tee reports/trivy.txt
+            ./bin/trivy image --image-src remote --format json --output reports/trivy.json "$IMAGE"
+            # Mettre --exit-code 1 --severity CRITICAL --ignore-unfixed pour rendre le job bloquant
+      - store_artifacts:
+          path: reports
+          destination: trivy-report
+
+  deploy-ssh-staging:
+    executor: simple-executor
+    steps:
+      - deploy-over-ssh:
+          app_env: staging
+          ssh_user_var: STAGING_SSH_USER
+          ssh_host_var: STAGING_SSH_HOST
+          known_hosts_var: STAGING_KNOWN_HOSTS
+          port: "8080"
+
+  deploy-ssh-production:
+    executor: simple-executor
+    steps:
+      - deploy-over-ssh:
+          app_env: prod
+          ssh_user_var: PRODUCTION_SSH_USER
+          ssh_host_var: PRODUCTION_SSH_HOST
+          known_hosts_var: PRODUCTION_KNOWN_HOSTS
+          port: "80"
+
+# ---------------------------------------------------------------------------
+# Workflow : qualité -> image -> scan -> validation manuelle -> déploiement
+# (l'ancien container_workflow est fusionné ici : on ne construit plus d'image
+#  si les tests ou l'audit de sécurité échouent)
+# ---------------------------------------------------------------------------
+workflows:
+  main_workflow:
+    jobs:
+      - debug-info
+      - build-setup
+      - lint-phpcs:
+          requires: [build-setup]
+      - lint-phpmd:
+          requires: [build-setup]
+      - lint-php-doc-check:
+          requires: [build-setup]
+      - metrics-phpmetrics:
+          requires: [build-setup]
+      - metrics-phploc:
+          requires: [build-setup]
+      - security-check-dependencies:
+          requires: [build-setup]
+      - test-phpunit:
+          requires: [build-setup]
+      - build-docker-image:
+          requires:
+            - test-phpunit
+            - security-check-dependencies
+            - lint-phpcs
+          filters:
+            branches:
+              only:
+                - master
+                - main
+                - develop
+                - /^feature\/.*/
+                - /^release\/.*/
+                - /^hotfix\/.*/
+                - /^bugfix\/.*/
+      - security-trivy-image:
+          requires: [build-docker-image]
+      - hold:
+          type: approval
+          requires:
+            - security-trivy-image
+          filters:
+            branches:
+              only:
+                - main
+                - master
+                - /^release\/.*/
+      - deploy-ssh-production:
+          requires: [hold]
+          filters:
+            branches:
+              only:
+                - main
+                - master
+      - deploy-ssh-staging:
+          requires: [hold]
+          filters:
+            branches:
+              only:
+                - /^release\/.*/
