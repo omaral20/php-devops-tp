@@ -1,4 +1,7 @@
 FROM php:8.2-apache
+
+# DL4006 : un pipe qui échoue fait échouer le RUN
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Amélioration possible (Partie 5) : épingler l'image par digest, ex. php:8.2-apache@sha256:...
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -14,17 +17,17 @@ ARG BUILD_DATE
 ARG TAG
 ARG GIT_COMMIT
 ARG GIT_URL
-ARG PROJECT_USERNAME="SI5"
+ARG PROJECT_OWNER="SI5"
 
 ENV VERSION="${TAG}"
 
 # Metadata (OCI)
-LABEL maintainer="${PROJECT_USERNAME}" \
-      org.opencontainers.image.authors="${PROJECT_USERNAME}" \
+LABEL maintainer="${PROJECT_OWNER}" \
+      org.opencontainers.image.authors="${PROJECT_OWNER}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.url="${GIT_URL}" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.vendor="${PROJECT_USERNAME}" \
+      org.opencontainers.image.vendor="${PROJECT_OWNER}" \
       org.opencontainers.image.licenses="proprietary" \
       org.opencontainers.image.title="PHP Devops TP" \
       org.opencontainers.image.description="Example of a PHP application automatically encapsulated inside a docker container by the CI pipeline" \
@@ -41,23 +44,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfreetype6-dev \
     libzip-dev \
     unzip \
-    wget \
     curl \
     ca-certificates \
-    bash
+    && rm -rf /var/lib/apt/lists/*
 
 # sqlite3 CLI
-RUN mkdir /opt/sqlite3 \
-    && cd /opt/sqlite3 \
-    && wget -q https://www.sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz \
-    && tar xfz sqlite-autoconf-${SQLITE_VERSION}.tar.gz \
-    && cd sqlite-autoconf-${SQLITE_VERSION} \
+WORKDIR /opt/sqlite3
+RUN curl -fsSL -o sqlite.tar.gz "https://www.sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz" \
+    && tar xzf sqlite.tar.gz --strip-components=1 \
     && CFLAGS="-O2 -DSQLITE_ENABLE_COLUMN_METADATA=1" ./configure \
-    && make -j$(nproc) \
+    && make -j"$(nproc)" \
     && make install \
     && ln -s /usr/local/bin/sqlite3 /usr/bin/sqlite3 \
-    && rm -Rf /opt/sqlite3 \
     && sqlite3 --version
+WORKDIR /
+RUN rm -rf /opt/sqlite3
 
 # Xdebug (optionnel, dev uniquement)
 RUN if [ "$INSTALL_XDEBUG" = "true" ]; then \
@@ -66,13 +67,14 @@ RUN if [ "$INSTALL_XDEBUG" = "true" ]; then \
 
 # PHP extensions
 RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
- && docker-php-ext-install -j$(nproc) gd pdo pdo_mysql zip pdo_sqlite
+ && docker-php-ext-install -j"$(nproc)" gd pdo pdo_mysql zip pdo_sqlite
 
 # Infisical CLI : le dépôt Cloudsmith ne sert plus la CLI depuis le 16/09/2026,
 # nouveau dépôt officiel : artifacts-cli.infisical.com
 RUN curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
     && apt-get update \
     && apt-get install -y --no-install-recommends infisical \
+    && rm -rf /var/lib/apt/lists/* \
     && infisical --version
 
 RUN apt-get clean \
@@ -106,6 +108,6 @@ RUN mkdir -p /var/www/html/database \
     && chown -R www-data:www-data /var/www/html/database
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsS -o /dev/null http://localhost/ || exit 1
+  CMD ["curl", "-fsS", "-o", "/dev/null", "http://localhost/"]
 
 EXPOSE 80
